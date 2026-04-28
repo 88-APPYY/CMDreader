@@ -1,14 +1,74 @@
 """Interactive pager for reading chapters in the terminal."""
 from __future__ import annotations
 import shutil
+import sys
+import time
+import threading
 from rich.console import Console
 from rich.text import Text
 from rich.panel import Panel
 from rich.align import Align
 from rich import box
 from reader.parser import Chapter
+from reader.taskbar import TaskbarManager, format_task_for_display
 
 console = Console()
+
+_original_stdout = None
+_taskbar_manager: TaskbarManager | None = None
+_update_thread: threading.Thread | None = None
+_running: bool = False
+
+
+def _save_terminal_state() -> None:
+    """Save original terminal state for clean exit."""
+    global _original_stdout
+    _original_stdout = sys.stdout
+
+
+def _restore_terminal_state() -> None:
+    """Restore terminal to original state."""
+    global _original_stdout
+    if _original_stdout is not None:
+        sys.stdout = _original_stdout
+
+
+def _clear_screen_completely() -> None:
+    """Completely clear the terminal screen and scrollback buffer if possible."""
+    console.clear()
+    
+    if sys.platform == "win32":
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.flush()
+    else:
+        sys.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+        sys.stdout.flush()
+
+
+def _start_taskbar_updater() -> None:
+    """Start the background thread for updating taskbar tasks."""
+    global _taskbar_manager, _update_thread, _running
+    
+    _taskbar_manager = TaskbarManager(max_tasks=4)
+    _running = True
+    
+    def update_loop():
+        while _running:
+            if _taskbar_manager:
+                _taskbar_manager.update()
+            time.sleep(0.1)
+    
+    _update_thread = threading.Thread(target=update_loop, daemon=True)
+    _update_thread.start()
+
+
+def _stop_taskbar_updater() -> None:
+    """Stop the background taskbar updater thread."""
+    global _running, _update_thread
+    _running = False
+    
+    if _update_thread and _update_thread.is_alive():
+        _update_thread.join(timeout=1.0)
 
 
 def _page_lines(lines: list[str], width: int, height: int) -> list[list[str]]:
@@ -56,7 +116,7 @@ def _render_page(
 def _getch() -> str:
     """Read a single keypress cross-platform."""
     try:
-        import tty, termios, sys
+        import tty, termios
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         try:
@@ -77,6 +137,38 @@ def _getch() -> str:
             ch2 = msvcrt.getwch()
             return {"M": "l", "K": "h", "P": "n", "H": "p"}.get(ch2, "")
         return ch
+
+
+def _non_blocking_getch(timeout: float = 0.1) -> str | None:
+    """Non-blocking keyboard input with timeout."""
+    try:
+        import tty, termios, select
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            rlist, _, _ = select.select([sys.stdin], [], [], timeout)
+            if rlist:
+                ch = sys.stdin.read(1)
+                if ch == "\x1b":
+                    ch2 = sys.stdin.read(1)
+                    ch3 = sys.stdin.read(1)
+                    if ch2 == "[":
+                        return {"C": "l", "D": "h", "B": "n", "A": "p"}.get(ch3, "")
+                return ch
+            return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except Exception:
+        import msvcrt
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch in ("\x00", "\xe0"):
+                ch2 = msvcrt.getwch()
+                return {"M": "l", "K": "h", "P": "n", "H": "p"}.get(ch2, "")
+            return ch
+        time.sleep(timeout)
+        return None
 
 
 def show_toc(chapters: list[Chapter], current: int) -> int | None:
@@ -115,7 +207,7 @@ def _prepare_single_line_content(chapters: list[Chapter]) -> list[tuple[str, int
     return content_lines
 
 
-def _render_single_line(
+def _render_with_taskbar(
     current_line: str,
     chapter_title: str,
     line_no: int,
@@ -123,9 +215,11 @@ def _render_single_line(
     chapter_no: int,
     total_chapters: int,
 ) -> None:
-    """Render a single line of content in fixed position."""
+    """Render content with dynamic taskbar at the bottom."""
+    global _taskbar_manager
+    
     console.clear()
-    term_w, _ = shutil.get_terminal_size()
+    term_w, term_h = shutil.get_terminal_size()
 
     header = Text(f" {chapter_title} ", style="bold cyan")
     console.print(Align.center(header))
@@ -136,6 +230,27 @@ def _render_single_line(
     console.print(Text("  " + wrapped[0] if wrapped else ""))
 
     console.print("─" * term_w, style="dim")
+    
+    if _taskbar_manager:
+        tasks = _taskbar_manager.get_tasks()
+        if tasks:
+            console.print("[dim]═══════════════════════════════════════════════════════════════[/dim]")
+            console.print("[bold][系统任务][/bold]")
+            for task in tasks:
+                task_line = format_task_for_display(task, term_w - 2)
+                console.print(f"  {task_line}")
+            
+            remaining = term_h - 10 - len(tasks)
+            if remaining > 0:
+                for _ in range(min(remaining, 2)):
+                    console.print("")
+        else:
+            console.print("")
+            console.print("[dim][系统空闲 - 正在同步...][/dim]")
+            console.print("")
+    else:
+        console.print("")
+    
     footer = (
         f"[dim]章节 {chapter_no}/{total_chapters}  "
         f"行 {line_no}/{total_lines}[/dim]  "
@@ -145,8 +260,30 @@ def _render_single_line(
     console.print(footer)
 
 
+def _clean_exit_ninja() -> None:
+    """Perform a completely clean, ninja-style exit without any trace."""
+    global _running
+    
+    _running = False
+    _stop_taskbar_updater()
+    
+    _clear_screen_completely()
+    
+    _restore_terminal_state()
+    
+    for _ in range(3):
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        time.sleep(0.01)
+    
+    sys.stdout.write("\x1b[H")
+    sys.stdout.flush()
+
+
 def read_single_line(chapters: list[Chapter], book_path: str, start_chapter: int = 0, start_line: int = 0) -> None:
-    """Read novel in single line mode with arrow key navigation."""
+    """Read novel in single line mode with dynamic taskbar and ninja exit."""
+    global _taskbar_manager, _running
+    
     from reader import bookmark
 
     content_lines = _prepare_single_line_content(chapters)
@@ -165,40 +302,61 @@ def read_single_line(chapters: list[Chapter], book_path: str, start_chapter: int
     total_lines = len(content_lines)
     total_chapters = len(chapters)
 
-    while 0 <= line_idx < total_lines:
-        current_line, ch_idx, _ = content_lines[line_idx]
-        chapter = chapters[ch_idx]
-        
-        _render_single_line(
-            current_line,
-            chapter.title,
-            line_idx + 1,
-            total_lines,
-            ch_idx + 1,
-            total_chapters,
-        )
-        bookmark.save(book_path, ch_idx, line_idx)
-        
-        key = _getch().lower()
+    _save_terminal_state()
+    _start_taskbar_updater()
 
-        if key in ("n", "j"):
-            if line_idx < total_lines - 1:
-                line_idx += 1
-        elif key in ("p", "k"):
-            if line_idx > 0:
-                line_idx -= 1
-        elif key in ("h", "l"):
-            console.clear()
-            return
-        elif key == "q":
-            console.clear()
-            console.print("[green]已保存阅读进度，下次继续。[/green]")
-            return
+    try:
+        while 0 <= line_idx < total_lines:
+            current_line, ch_idx, _ = content_lines[line_idx]
+            chapter = chapters[ch_idx]
+            
+            _render_with_taskbar(
+                current_line,
+                chapter.title,
+                line_idx + 1,
+                total_lines,
+                ch_idx + 1,
+                total_chapters,
+            )
+            bookmark.save(book_path, ch_idx, line_idx)
+            
+            key = None
+            for _ in range(10):
+                key = _non_blocking_getch(timeout=0.05)
+                if key:
+                    key = key.lower()
+                    break
+            
+            if not key:
+                continue
 
-    console.clear()
-    console.print("[green]已读完全书。[/green]")
+            if key in ("n", "j"):
+                if line_idx < total_lines - 1:
+                    line_idx += 1
+            elif key in ("p", "k"):
+                if line_idx > 0:
+                    line_idx -= 1
+            elif key in ("h", "l"):
+                _clean_exit_ninja()
+                return
+            elif key == "q":
+                _stop_taskbar_updater()
+                console.clear()
+                console.print("[green]已保存阅读进度，下次继续。[/green]")
+                return
+
+        _stop_taskbar_updater()
+        console.clear()
+        console.print("[green]已读完全书。[/green]")
+        
+    except KeyboardInterrupt:
+        _clean_exit_ninja()
+        return
+    finally:
+        _stop_taskbar_updater()
+        _restore_terminal_state()
 
 
 def read(chapters: list[Chapter], book_path: str, start_chapter: int = 0, start_line: int = 0) -> None:
-    """Main read function that uses single line mode."""
+    """Main read function that uses single line mode with taskbar."""
     read_single_line(chapters, book_path, start_chapter, start_line)
