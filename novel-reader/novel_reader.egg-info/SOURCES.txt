@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+novel_reader.egg-info/PKG-INFO
+novel_reader.egg-info/SOURCES.txt
+novel_reader.egg-info/dependency_links.txt
+novel_reader.egg-info/entry_points.txt
+novel_reader.egg-info/requires.txt
+novel_reader.egg-info/top_level.txt
+reader/__init__.py
+reader/bookmark.py
+reader/cli.py
+reader/display.py
+reader/parser.py

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: novel-reader
+Version: 0.1.0
+Summary: A terminal novel reader
+Requires-Python: >=3.8
+Requires-Dist: click>=8.0
+Requires-Dist: rich>=13.0
+Requires-Dist: ebooklib>=0.18
+Requires-Dist: beautifulsoup4>=4.12

@@ -20,7 +20,6 @@ def _page_lines(lines: list[str], width: int, height: int) -> list[list[str]]:
             wrapped.extend(textwrap.wrap(line, width) or [line])
         else:
             wrapped.append("")
-    # Reserve 4 rows for header/footer
     page_size = max(height - 4, 5)
     return [wrapped[i : i + page_size] for i in range(0, max(len(wrapped), 1), page_size)]
 
@@ -63,7 +62,6 @@ def _getch() -> str:
         try:
             tty.setraw(fd)
             ch = sys.stdin.read(1)
-            # Handle arrow keys (ESC sequences)
             if ch == "\x1b":
                 ch2 = sys.stdin.read(1)
                 ch3 = sys.stdin.read(1)
@@ -73,7 +71,6 @@ def _getch() -> str:
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
     except Exception:
-        # Windows fallback
         import msvcrt
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):
@@ -108,64 +105,100 @@ def show_toc(chapters: list[Chapter], current: int) -> int | None:
     return None
 
 
-def read(chapters: list[Chapter], book_path: str, start_chapter: int = 0, start_line: int = 0) -> None:
+def _prepare_single_line_content(chapters: list[Chapter]) -> list[tuple[str, int, int]]:
+    """Prepare all content as single lines with chapter info."""
+    content_lines = []
+    for ch_idx, chapter in enumerate(chapters):
+        for line_idx, line in enumerate(chapter.lines):
+            if line.strip():
+                content_lines.append((line.strip(), ch_idx, line_idx))
+    return content_lines
+
+
+def _render_single_line(
+    current_line: str,
+    chapter_title: str,
+    line_no: int,
+    total_lines: int,
+    chapter_no: int,
+    total_chapters: int,
+) -> None:
+    """Render a single line of content in fixed position."""
+    console.clear()
+    term_w, _ = shutil.get_terminal_size()
+
+    header = Text(f" {chapter_title} ", style="bold cyan")
+    console.print(Align.center(header))
+    console.print("─" * term_w, style="dim")
+
+    import textwrap
+    wrapped = textwrap.wrap(current_line, term_w - 4) or [current_line]
+    console.print(Text("  " + wrapped[0] if wrapped else ""))
+
+    console.print("─" * term_w, style="dim")
+    footer = (
+        f"[dim]章节 {chapter_no}/{total_chapters}  "
+        f"行 {line_no}/{total_lines}[/dim]  "
+        "[cyan]↑[/cyan] 上一行  [cyan]↓[/cyan] 下一行  "
+        "[cyan]←/→[/cyan] 退出"
+    )
+    console.print(footer)
+
+
+def read_single_line(chapters: list[Chapter], book_path: str, start_chapter: int = 0, start_line: int = 0) -> None:
+    """Read novel in single line mode with arrow key navigation."""
     from reader import bookmark
 
-    term_w, term_h = shutil.get_terminal_size()
-    ch_idx = start_chapter
-    line_offset = start_line  # which page we start on (approximation)
+    content_lines = _prepare_single_line_content(chapters)
+    
+    if not content_lines:
+        console.clear()
+        console.print("[red]小说内容为空[/red]")
+        return
 
-    while 0 <= ch_idx < len(chapters):
+    line_idx = 0
+    for i, (_, ch_idx, _) in enumerate(content_lines):
+        if ch_idx >= start_chapter:
+            line_idx = i
+            break
+
+    total_lines = len(content_lines)
+    total_chapters = len(chapters)
+
+    while 0 <= line_idx < total_lines:
+        current_line, ch_idx, _ = content_lines[line_idx]
         chapter = chapters[ch_idx]
-        pages = _page_lines(chapter.lines, term_w - 4, term_h)
-        if not pages:
-            pages = [[""]]
+        
+        _render_single_line(
+            current_line,
+            chapter.title,
+            line_idx + 1,
+            total_lines,
+            ch_idx + 1,
+            total_chapters,
+        )
+        bookmark.save(book_path, ch_idx, line_idx)
+        
+        key = _getch().lower()
 
-        pg = min(line_offset, len(pages) - 1)
-        line_offset = 0  # reset after first chapter load
-
-        while True:
-            _render_page(
-                pages[pg],
-                chapter.title,
-                pg + 1,
-                len(pages),
-                ch_idx + 1,
-                len(chapters),
-            )
-            bookmark.save(book_path, ch_idx, pg)
-            key = _getch().lower()
-
-            if key in ("l", " ", "\r"):   # next page
-                if pg < len(pages) - 1:
-                    pg += 1
-                elif ch_idx < len(chapters) - 1:
-                    ch_idx += 1
-                    break
-            elif key == "h":              # prev page
-                if pg > 0:
-                    pg -= 1
-                elif ch_idx > 0:
-                    ch_idx -= 1
-                    line_offset = 9999   # go to last page of prev chapter
-                    break
-            elif key == "n":              # next chapter
-                if ch_idx < len(chapters) - 1:
-                    ch_idx += 1
-                    break
-            elif key == "p":              # prev chapter
-                if ch_idx > 0:
-                    ch_idx -= 1
-                    break
-            elif key == "t":              # table of contents
-                result = show_toc(chapters, ch_idx)
-                if result is not None:
-                    ch_idx = result
-                    break
-            elif key == "q":              # quit
-                console.clear()
-                console.print("[green]已保存阅读进度，下次继续。[/green]")
-                return
+        if key in ("n", "j"):
+            if line_idx < total_lines - 1:
+                line_idx += 1
+        elif key in ("p", "k"):
+            if line_idx > 0:
+                line_idx -= 1
+        elif key in ("h", "l"):
+            console.clear()
+            return
+        elif key == "q":
+            console.clear()
+            console.print("[green]已保存阅读进度，下次继续。[/green]")
+            return
 
     console.clear()
     console.print("[green]已读完全书。[/green]")
+
+
+def read(chapters: list[Chapter], book_path: str, start_chapter: int = 0, start_line: int = 0) -> None:
+    """Main read function that uses single line mode."""
+    read_single_line(chapters, book_path, start_chapter, start_line)
